@@ -1,0 +1,3 @@
+{"run_id": "bc_libero_object_t0_s0", "method": "bc", "seed": 0, "order": [0], "stage": 0, "task": 0, "kind": "post", "n_rollouts": 50, "successes": 41, "suite": "libero_object"}
+{"run_id": "bc_cumulative_scratch_libero_spatial_o0_s0", "method": "bc_cumulative_scratch", "seed": 0, "order": [0], "stage": 0, "task": 0, "kind": "post", "n_rollouts": 50, "successes": 37, "suite": "libero_spatial"}
+{"run_id": "flowdpg_cumulative_scratch_libero_spatial_o0_s0", "method": "flowdpg_cumulative_scratch", "seed": 0, "order": [0], "stage": 0, "task": 0, "kind": "post", "n_rollouts": 50, "successes": 43, "suite": "libero_spatial"}
