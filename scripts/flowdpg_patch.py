@@ -40,6 +40,7 @@ import torch.nn.functional as F
 OBS_STATE = "observation.state"
 OBS_IMAGES = "observation.images"
 ACTION = "action"
+REWARD = "next.reward"
 
 
 @dataclass
@@ -139,6 +140,35 @@ def critic_push(q_net: TwinQ, cond: torch.Tensor, a_hat: torch.Tensor, u_t: torc
     return delta.detach(), g_norm.mean().detach()
 
 
+def chunk_reward_and_done(batch: dict, bsz: int, k: int, hp: "FDPGConfig"):
+    """Reward and terminal flag of the chunk transition (s_t, a_t..a_{t+K-1}) -> s_{t+K}.
+
+    If the dataset has a "next.reward" column (rollouts, or demos prepared by
+    build_task_dataset.py) the patch requests its K-step window: reward = sum_j gamma^j r_{t+j},
+    terminal = any reward > 0 (LIBERO ends an episode on success; reward is 1 only then).
+    An episode that ends without success (time limit) is NOT terminal: V(s') is bootstrapped from
+    the last frame (LeRobot pads past the end by repeating it).
+    Without a reward column (raw lerobot/libero demos, all successful) the end of the demo inside
+    the chunk counts as success, read from "observation.state_is_pad" at t+K.
+    Returns (reward, done, "data" | "inferred").
+    """
+    rew = batch.get(REWARD)
+    if rew is not None:
+        rew = rew.reshape(bsz, -1).float()
+        if rew.shape[1] != k:
+            raise RuntimeError(f"{REWARD} window has {rew.shape[1]} steps, expected {k}")
+        rpad = batch.get(f"{REWARD}_is_pad")
+        if rpad is not None:
+            rew = rew.masked_fill(rpad.reshape(bsz, -1).bool(), 0.0)
+        w = hp.gamma ** torch.arange(k, device=rew.device, dtype=rew.dtype)
+        return (rew * w).sum(1), (rew > 0).any(1).float(), "data"
+    pad = batch.get(f"{OBS_STATE}_is_pad")
+    if pad is None:
+        raise RuntimeError(f"neither {REWARD} nor {OBS_STATE}_is_pad in batch: cannot tell episode ends")
+    done = pad[:, -1].float()
+    return done * hp.terminal_reward, done, "inferred"
+
+
 def split_time(batch: dict, n_obs: int):
     """Split the stacked (current + next) observation windows into two batches."""
     cur, nxt = dict(batch), dict(batch)
@@ -158,6 +188,11 @@ def _patched_obs_delta_indices(self) -> list:
     k = self.n_action_steps
     cur = list(range(1 - self.n_obs_steps, 1))
     return cur + [i + k for i in cur]
+
+
+def _patched_reward_delta_indices(self) -> list:
+    """Rewards of the K executed actions a_t .. a_{t+K-1} (used only if the dataset has next.reward)."""
+    return list(range(0, self.n_action_steps))
 
 
 def _make_init(orig_init, hp: FDPGConfig):
@@ -217,11 +252,7 @@ def _forward(self, batch: dict, reduction: str = "mean"):
     bsz = data.shape[0]
     a_exec = data[:, s:s + k].reshape(bsz, -1)
 
-    pad = batch.get(f"{OBS_STATE}_is_pad")
-    if pad is None:
-        raise RuntimeError(f"{OBS_STATE}_is_pad missing from batch: cannot tell episode ends")
-    done = pad[:, -1].float()                        # obs at t+K lies past the episode end
-    reward = done * hp.terminal_reward
+    reward, done, source = chunk_reward_and_done(batch, bsz, k, hp)
     disc = hp.gamma ** k
 
     # ---- critic (IQL)
@@ -267,6 +298,7 @@ def _forward(self, batch: dict, reduction: str = "mean"):
         "fdpg_lambda": lam, "fdpg_v_loss": v_loss.item(), "fdpg_q_loss": q_loss.item(),
         "fdpg_q_mean": q1.mean().item(), "fdpg_v_mean": v.mean().item(),
         "fdpg_done_frac": done.mean().item(), "fdpg_grad_norm": float(g_norm),
+        "fdpg_reward_from_data": float(source == "data"),
     }
     return loss, info
 
@@ -281,6 +313,7 @@ def install(hp: FDPGConfig, policy_cls=None, config_cls=None) -> None:
     if getattr(policy_cls, "_fdpg_installed", False):
         return
     config_cls.observation_delta_indices = property(_patched_obs_delta_indices)
+    config_cls.reward_delta_indices = property(_patched_reward_delta_indices)
     policy_cls.__init__ = _make_init(policy_cls.__init__, hp)
     policy_cls.get_optim_params = _make_get_optim_params(policy_cls.get_optim_params)
     policy_cls.forward = _forward
