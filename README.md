@@ -4,7 +4,9 @@ Offline FlowDPG on LeRobot's MultiTaskDiT flow-matching policy, evaluated on LIB
 tooling for the cumulative-data continual experiment (stage runner, CLARE-style triangle metrics).
 
 Status (29 Oct 2026): single-task flow-matching BC and single-task offline FlowDPG run end to end.
-Online RL and rollout collection are the next milestone.
+Rollout collection (successes and failures, with reward / success labels), the demo dataset builder,
+dataset merging and the critic Q-value diagnostic are implemented; the offline-to-online loop on one
+task is the current milestone.
 
 ## Results so far
 
@@ -35,13 +37,19 @@ normalisation, checkpointing and `lerobot-eval` are reused unchanged
 - **Transitions at chunk level.** The policy predicts a chunk of H = 32 actions and executes
   K = 24 (`n_action_steps`). The patch extends `observation_delta_indices` by K, so each sample
   also carries the observation window at t+K. The critic scores the K executed actions.
-- **Reward / termination.** `observation.state_is_pad` at t+K marks that the episode ended inside
-  the executed chunk. Demos are all successes, so such transitions get reward 1 and are terminal;
-  otherwise reward 0 and bootstrap with discount gamma^K (gamma = 0.99 per step).
-  *To change for online data:* reward and done must come from the stored success / termination
-  labels, and time-limit truncation must not be treated as failure-terminal.
-- **Critic (IQL).** Twin Q(s, a_exec) and V(s), 3x512 MLPs with LayerNorm, on the policy's own
-  conditioning vector **detached** (critic does not train the CLIP/state encoders).
+- **Reward / termination.** Sparse success reward (1 on the success step, 0 otherwise).
+  If the dataset has `next.reward` (rollouts, and demos prepared with `build_task_dataset.py`) the
+  patch loads its K-step window: r = sum_j gamma^j r_{t+j}, terminal = any success in the window
+  (LIBERO ends an episode on success). Episodes that end without success (time limit) are not
+  terminal: V(s') is bootstrapped from the last frame. Without a reward column (raw `lerobot/libero`,
+  all demos successful) the demo end inside the chunk is taken as the success
+  (`observation.state_is_pad` at t+K). gamma = 0.99 per step, chunk discount gamma^K.
+- **Critic (IQL).** Twin Q(s, a_exec) and V(s) on the policy's own conditioning vector **detached**
+  (critic does not train the CLIP/state encoders). The conditioning vector is large
+  ((8 state + 2x768 CLIP + 512 text) x 2 steps = 4112) compared with the action chunk (24 x 7 = 168).
+  Default `critic_arch=split`: obs -> 256 and action -> 256 through separate projections, then a
+  2x512 MLP, so the action is not drowned out. `critic_arch=concat` (one MLP on [obs, action], used
+  for all runs before 3 Nov) is kept; scripts read the architecture from the checkpoint.
   V: expectile 0.7 on min target-Q of the data action. Q: MSE to r + gamma^K (1 - done) V(s').
   Target Q by Polyak averaging (tau = 0.005) in `update()`. Critic lr 3e-4 (own param group).
 - **Actor (FlowDPG).** With LeRobot's path x_t = t a + (1 - (1 - sigma) t) x0 and
@@ -52,6 +60,8 @@ normalisation, checkpointing and `lerobot-eval` are reused unchanged
   - L = lam ||v - u*||^2 + (1 - lam) ||v - u_t||^2 + w_c ||a_hat - a||^2
   - alpha = 0.5, lam ramps 0 -> 0.5 over 2,000 steps, w_c = 1.0. No backprop through the ODE.
 - `--fdpg.mode=bc_critic` keeps critic and consistency term but sets lam = 0 (control run).
+- Flow-time sampling: LeRobot's default is a beta distribution that favours small t (noisy
+  inputs); the FlowDPG paper samples t uniformly. `run_stages.py --timestep uniform` sets it.
 - Logged per step: `fdpg_bc, fdpg_rl, fdpg_cons, fdpg_lambda, fdpg_v_loss, fdpg_q_loss,
   fdpg_q_mean, fdpg_v_mean, fdpg_done_frac, fdpg_grad_norm`.
 
@@ -70,8 +80,13 @@ scripts/
   list_tasks.py            task -> episode map for lerobot/libero (writes task_episodes.json)
   episodes_for_env_task.py episode list for one env task, matched by instruction text
   report.py                triangle heatmap + AUC / FWT / NBT from a cells.jsonl
+  libero_data.py           shared dataset schema (cameras, 8-d state, action, next.reward/success/done)
+  build_task_dataset.py    demos of chosen tasks -> local dataset with reward/success/done labels
+  collect_rollouts.py      run a policy in LIBERO, save every episode (incl. failures) in that schema
+  merge_data.py            merge demos + rollout rounds into one training dataset
+  q_along_episode.py       critic diagnostic: Q and V along demos / rollouts vs gamma^(steps to success)
 src/cfdpg/                 results store, metrics, heatmap, samplers, dataset manifest
-tests/                     49 tests (metrics, samplers, runner helpers, FlowDPG patch on a stand-in)
+tests/                     59 tests (metrics, samplers, runner, FlowDPG patch on a stand-in, rollout frames)
 notes/experiment_log.md
 ```
 
@@ -108,4 +123,19 @@ python scripts/report.py $WORK/runs/<run_id>/cells.jsonl
 FlowDPG checkpoints contain the critic, so evaluate them through the launcher:
 `python scripts/flowdpg_launch.py eval --policy.path=... <lerobot-eval args>`.
 
-Tests: `pip install numpy matplotlib pytest torch && python -m pytest`.
+Offline-to-online data flow for one task (storage on fafnir's HDD):
+```bash
+export DATA=/media/internal/hdd/$USER/data
+python scripts/build_task_dataset.py --suite libero_spatial --task_ids 0 --out $DATA/spatial_t0_demos
+python scripts/collect_rollouts.py --policy_path <ckpt>/pretrained_model --suite libero_spatial --task_id 0 \
+    --n_episodes 50 --batch_size 10 --seed 1000 --out $DATA/spatial_t0_rollouts_r1
+python scripts/merge_data.py --inputs $DATA/spatial_t0_demos $DATA/spatial_t0_rollouts_r1 --out $DATA/spatial_t0_r1
+python scripts/q_along_episode.py --policy_path <ckpt>/pretrained_model --root $DATA/spatial_t0_rollouts_r1 \
+    --episodes 0 1 2 --out $WORK/q_rollouts_r1.png
+```
+Rollouts record the observation exactly as the policy sees it after LeRobot's LIBERO processing
+(the demo dataset's format, 256x256), so demos and rollouts merge into one training set.
+
+Tests: `pip install numpy matplotlib pytest torch && python -m pytest`. The dataset pipeline
+(build -> record -> merge -> load with the patch's reward window) was also checked end to end with
+LeRobot's dataset code on synthetic data; collection inside the LIBERO simulator is untested outside fafnir.
