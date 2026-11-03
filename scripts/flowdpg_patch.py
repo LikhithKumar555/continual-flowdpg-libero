@@ -235,9 +235,34 @@ def actor_weights(batch: dict, bsz: int, hp: "FDPGConfig", device) -> torch.Tens
     """Per-sample actor weights (B,). 1 everywhere unless actor_data="success" and the dataset
     has an episode_success column, then 1 for frames of successful episodes and 0 otherwise."""
     ones = torch.ones(bsz, device=device)
-    if hp.actor_data == "all" or EP_SUCCESS not in batch:
+    if hp.actor_data == "all":
         return ones
+    if EP_SUCCESS not in batch:
+        if REWARD in batch:
+            # Our datasets (demos built by build_task_dataset.py, rollouts) carry both columns, so a
+            # missing flag means it was dropped on the way: fail instead of silently imitating failures.
+            raise RuntimeError(
+                f"actor_data=success but '{EP_SUCCESS}' is missing from the batch while '{REWARD}' is present. "
+                "Was the dataset built with the current libero_data.py, and is the patch's processor "
+                "key registration active (keep_episode_success_key)?")
+        return ones                                   # raw lerobot/libero demos: all successful
     return batch[EP_SUCCESS].reshape(bsz, -1)[:, 0].to(device=device, dtype=torch.float32)
+
+
+def keep_episode_success_key() -> bool:
+    """LeRobot's batch->transition converter keeps only a fixed list of extra keys (plus *_is_pad) and
+    drops everything else before the policy sees the batch. Add episode_success to that list.
+    Returns True if registered (or already present)."""
+    try:
+        from lerobot.processor import converters
+    except ImportError:
+        return False
+    keys = getattr(converters, "_COMPLEMENTARY_KEYS", None)
+    if keys is None:
+        return False
+    if EP_SUCCESS not in keys:
+        converters._COMPLEMENTARY_KEYS = tuple(keys) + (EP_SUCCESS,)
+    return True
 
 
 def weighted_mse(pred: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
@@ -395,6 +420,9 @@ def install(hp: FDPGConfig, policy_cls=None, config_cls=None) -> None:
         config_cls = config_cls or MultiTaskDiTConfig
     if getattr(policy_cls, "_fdpg_installed", False):
         return
+    if not keep_episode_success_key() and hp.actor_data == "success":
+        print("[flowdpg] WARNING: could not register episode_success with LeRobot's processor; "
+              "training on rollout data will stop with an error", flush=True)
     config_cls.observation_delta_indices = property(_patched_obs_delta_indices)
     config_cls.reward_delta_indices = property(_patched_reward_delta_indices)
     policy_cls.__init__ = _make_init(policy_cls.__init__, hp)
