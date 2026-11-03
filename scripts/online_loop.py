@@ -92,9 +92,11 @@ def main():
             return
         if train_dir.exists() and not a.dry_run:
             train_dir.rename(train_dir.with_name(train_dir.name + f"_incomplete_{os.getpid()}"))
-        cmd = [py, LAUNCHER, "train"]
+        # --fdpg settings apply to every round (warm starts too); the critic architecture of a warm
+        # start is read from its checkpoint by the launcher.
+        cmd = [py, LAUNCHER, "train"] + [f"--fdpg.{kv}" for kv in a.fdpg]
         if init is None:
-            cmd += [f"--fdpg.{kv}" for kv in a.fdpg] + POLICY + [f"--policy.timestep_sampling_strategy={a.timestep}"]
+            cmd += POLICY + [f"--policy.timestep_sampling_strategy={a.timestep}"]
         else:
             cmd += [f"--policy.path={init}"]
         cmd += [f"--dataset.repo_id=local/{data_dir.name}", f"--dataset.root={data_dir}",

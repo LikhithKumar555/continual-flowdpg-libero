@@ -18,6 +18,7 @@ ACTION = "action"
 REWARD = "next.reward"
 SUCCESS = "next.success"
 DONE = "next.done"
+EP_SUCCESS = "episode_success"   # 1.0 on every frame of an episode that ended in success (demos: always)
 DEFAULT_FEATURES = {"timestamp", "frame_index", "episode_index", "index", "task_index"}
 SRC_REPO = "lerobot/libero"
 
@@ -25,6 +26,7 @@ LABEL_SPECS = {
     REWARD: {"dtype": "float32", "shape": [1], "names": None},
     SUCCESS: {"dtype": "bool", "shape": [1], "names": None},
     DONE: {"dtype": "bool", "shape": [1], "names": None},
+    EP_SUCCESS: {"dtype": "float32", "shape": [1], "names": None},
 }
 
 
@@ -115,6 +117,7 @@ def build_demo_dataset(episodes: list[int], out_dir: Path, repo_id: str, src_rep
             frame[REWARD] = np.array([1.0 if last else 0.0], dtype=np.float32)
             frame[SUCCESS] = np.array([last])
             frame[DONE] = np.array([last])
+            frame[EP_SUCCESS] = np.array([1.0], dtype=np.float32)
             frame["task"] = item["task"]
             dst.add_frame(frame)
             if last:
@@ -149,6 +152,7 @@ def episode_frames(obs_steps: list[dict], actions: list, env_idx: int, successes
                   (sparse success reward, as agreed with the supervisor).
     """
     frames = []
+    ep_ok = any(bool(successes[env_idx][t]) for t in range(done_idx + 1))
     for t in range(done_idx + 1):
         o = obs_steps[t]
         frame = {k: image_to_uint8_hwc(o[k][env_idx]) for k in cam_keys}
@@ -160,6 +164,7 @@ def episode_frames(obs_steps: list[dict], actions: list, env_idx: int, successes
         frame[REWARD] = np.array([1.0 if ok else 0.0], dtype=np.float32)
         frame[SUCCESS] = np.array([ok])
         frame[DONE] = np.array([t == done_idx])
+        frame[EP_SUCCESS] = np.array([1.0 if ep_ok else 0.0], dtype=np.float32)
         frame["task"] = task
         frames.append(frame)
     return frames

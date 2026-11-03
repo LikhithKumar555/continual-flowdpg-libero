@@ -60,6 +60,7 @@ class FDPGConfig:
     critic_arch: str = "split"     # "split": separate obs / action projections (default); "concat": one MLP on [obs, act]
     proj_dim: int = 256            # width of each projection in the split critic
     critic_weight: float = 1.0
+    actor_data: str = "success"    # actor learns from "success" episodes only (critic: all data), or "all"
     eps: float = 1e-6
 
     @classmethod
@@ -74,6 +75,8 @@ class FDPGConfig:
             raise SystemExit("--fdpg.mode must be flowdpg or bc_critic")
         if cfg.critic_arch not in ("split", "concat"):
             raise SystemExit("--fdpg.critic_arch must be split or concat")
+        if cfg.actor_data not in ("success", "all"):
+            raise SystemExit("--fdpg.actor_data must be success or all")
         return cfg
 
     def to_json(self) -> str:
@@ -225,6 +228,24 @@ def chunk_reward_and_done(batch: dict, bsz: int, k: int, hp: "FDPGConfig"):
     return done * hp.terminal_reward, done, "inferred"
 
 
+EP_SUCCESS = "episode_success"
+
+
+def actor_weights(batch: dict, bsz: int, hp: "FDPGConfig", device) -> torch.Tensor:
+    """Per-sample actor weights (B,). 1 everywhere unless actor_data="success" and the dataset
+    has an episode_success column, then 1 for frames of successful episodes and 0 otherwise."""
+    ones = torch.ones(bsz, device=device)
+    if hp.actor_data == "all" or EP_SUCCESS not in batch:
+        return ones
+    return batch[EP_SUCCESS].reshape(bsz, -1)[:, 0].to(device=device, dtype=torch.float32)
+
+
+def weighted_mse(pred: torch.Tensor, target: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+    """Mean squared error per sample, averaged with weights w (B,). All-zero weights give 0."""
+    per = (pred - target).pow(2).reshape(pred.shape[0], -1).mean(dim=1)
+    return (per * w).sum() / w.sum().clamp_min(1.0)
+
+
 def split_time(batch: dict, n_obs: int):
     """Split the stacked (current + next) observation windows into two batches."""
     cur, nxt = dict(batch), dict(batch)
@@ -333,19 +354,24 @@ def _forward(self, batch: dict, reduction: str = "mean"):
     v_pred = self.noise_predictor(x_t, t, conditioning_vec=cond)
     a_hat = x_t + (1 - te) * v_pred
 
-    bc_loss = F.mse_loss(v_pred, u_t)
+    # Which samples the actor learns from: with actor_data="success" only frames of episodes that
+    # ended in success (demos, successful rollouts). Every actor term regresses towards the data
+    # action, so failed rollouts would otherwise be imitated. The critic above uses all data.
+    w = actor_weights(batch, bsz, hp, data.device)
+
+    bc_loss = weighted_mse(v_pred, u_t, w)
     lam = lambda_at(int(self.fdpg_step.item()), hp)
     g_norm = torch.zeros((), device=data.device)
     if lam > 0:
         delta, g_norm = critic_push(self.fdpg_q, c, a_hat, u_t, s, k, hp.alpha, hp.eps)
         a_star = a_hat.detach() + delta
         u_star = a_star - (1 - sigma) * noise
-        rl_loss = F.mse_loss(v_pred, u_star)
+        rl_loss = weighted_mse(v_pred, u_star, w)
         actor_loss = lam * rl_loss + (1 - lam) * bc_loss
     else:
         rl_loss = torch.zeros((), device=data.device)
         actor_loss = bc_loss
-    cons_loss = F.mse_loss(a_hat, data)
+    cons_loss = weighted_mse(a_hat, data, w)
     actor_loss = actor_loss + hp.consistency_weight * cons_loss
 
     loss = actor_loss + hp.critic_weight * critic_loss
@@ -355,6 +381,7 @@ def _forward(self, batch: dict, reduction: str = "mean"):
         "fdpg_q_mean": q1.mean().item(), "fdpg_v_mean": v.mean().item(),
         "fdpg_done_frac": done.mean().item(), "fdpg_grad_norm": float(g_norm),
         "fdpg_reward_from_data": float(source == "data"),
+        "fdpg_actor_frac": float((w > 0).float().mean()),
     }
     return loss, info
 
