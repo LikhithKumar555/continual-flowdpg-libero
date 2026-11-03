@@ -244,3 +244,93 @@ def test_training_reduces_critic_error_and_matches_terminal_value():
     done = b[f"{fp.OBS_STATE}_is_pad"][:, -1]
     assert q[done].mean() == pytest.approx(1.0, abs=0.15)
     assert q[~done].mean() < q[done].mean()
+
+
+# ---------------------------------------------------------------- reward from data (online rollouts)
+
+def test_reward_window_success_is_discounted_and_terminal():
+    hp = fp.FDPGConfig(gamma=0.9)
+    rew = torch.zeros(2, K, 1)
+    rew[0, 2] = 1.0                                   # success at the 3rd executed step
+    batch = {fp.REWARD: rew, f"{fp.REWARD}_is_pad": torch.zeros(2, K, dtype=torch.bool)}
+    r, d, src = fp.chunk_reward_and_done(batch, 2, K, hp)
+    assert src == "data"
+    assert r.tolist() == pytest.approx([0.9 ** 2, 0.0])
+    assert d.tolist() == [1.0, 0.0]
+
+
+def test_reward_window_padding_is_ignored():
+    hp = fp.FDPGConfig()
+    rew = torch.ones(1, K, 1)                          # padded copies of a success frame
+    pad = torch.ones(1, K, dtype=torch.bool)
+    pad[0, 0] = False
+    r, d, _ = fp.chunk_reward_and_done({fp.REWARD: rew, f"{fp.REWARD}_is_pad": pad}, 1, K, hp)
+    assert r.item() == pytest.approx(1.0) and d.item() == 1.0
+
+
+def test_reward_inferred_without_column():
+    b = make_batch(b=4, done_frac=0.5)
+    r, d, src = fp.chunk_reward_and_done(b, 4, K, fp.FDPGConfig())
+    assert src == "inferred" and d.tolist() == [1.0, 1.0, 0.0, 0.0] and r.tolist() == [1.0, 1.0, 0.0, 0.0]
+
+
+def test_reward_delta_indices_patched():
+    assert FakeConfig().reward_delta_indices == list(range(K))
+
+
+def test_forward_uses_data_reward_when_present():
+    torch.manual_seed(0)
+    pol = FakePolicy(FakeConfig())
+    b = make_batch(b=8, done_frac=0.0)
+    rew = torch.zeros(8, K, 1)
+    rew[:3, -1] = 1.0
+    b[fp.REWARD] = rew
+    _, info = pol(b)
+    assert info["fdpg_reward_from_data"] == 1.0
+    assert info["fdpg_done_frac"] == pytest.approx(3 / 8)
+
+
+# ---------------------------------------------------------------- critic architecture (split vs concat)
+
+def test_split_critic_has_separate_projections():
+    q = fp.TwinQ(cond_dim=4112, act_dim=168, hidden=512, arch="split", proj_dim=256)
+    w_obs = q.q1.obs[1].weight
+    w_act = q.q1.act[0].weight
+    assert w_obs.shape == (256, 4112) and w_act.shape == (256, 168)
+    assert q.q1.mlp[0].weight.shape == (512, 512)       # [obs_proj, act_proj] -> hidden
+    c, a = torch.randn(3, 4112), torch.randn(3, 168)
+    q1, q2 = q(c, a)
+    assert q1.shape == (3,) and q2.shape == (3,)
+
+
+def test_concat_critic_keeps_old_parameter_names():
+    q = fp.TwinQ(cond_dim=6, act_dim=4, hidden=8, arch="concat")
+    keys = set(q.state_dict())
+    assert "q1.1.weight" in keys and "q2.1.weight" in keys      # names of pre-split checkpoints
+    assert q.q1[1].weight.shape == (8, 10)
+
+
+@pytest.mark.parametrize("arch", ["split", "concat"])
+def test_critic_settings_detected_from_checkpoint(tmp_path, arch):
+    safetensors = pytest.importorskip("safetensors.torch")
+    hp = fp.FDPGConfig(hidden=32, critic_arch=arch, proj_dim=16)
+    pol = FakePolicy(FakeConfig())                       # installed with defaults; rebuild critic
+    cond_dim = pol.observation_encoder.conditioning_dim
+    pol.fdpg_q = fp.TwinQ(cond_dim, A * K, hp.hidden, arch=arch, proj_dim=hp.proj_dim)
+    safetensors.save_file({k: v.contiguous() for k, v in pol.state_dict().items()},
+                          str(tmp_path / "model.safetensors"))
+    found = fp.critic_settings_from_checkpoint(tmp_path)
+    assert found["critic_arch"] == arch and found["hidden"] == 32
+    if arch == "split":
+        assert found["proj_dim"] == 16
+
+
+def test_no_critic_in_plain_checkpoint(tmp_path):
+    safetensors = pytest.importorskip("safetensors.torch")
+    safetensors.save_file({"noise_predictor.w": torch.zeros(2)}, str(tmp_path / "model.safetensors"))
+    assert fp.critic_settings_from_checkpoint(tmp_path) == {}
+
+
+def test_bad_arch_rejected():
+    with pytest.raises(SystemExit):
+        fp.FDPGConfig.from_args({"critic_arch": "huge"})
