@@ -48,9 +48,6 @@ def main():
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo_id", default=None)
-    ap.add_argument("--flowdpg", action=argparse.BooleanOptionalAction, default=True,
-                    help="checkpoint contains the FlowDPG critic (use --no-flowdpg for plain BC checkpoints)")
-    ap.add_argument("--fdpg_hidden", type=int, default=512)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
@@ -60,9 +57,11 @@ def main():
     if out.exists():
         raise SystemExit(f"{out} exists; use a new folder per round")
 
-    if a.flowdpg:
-        from flowdpg_patch import FDPGConfig, install
-        install(FDPGConfig(hidden=a.fdpg_hidden))
+    from flowdpg_patch import FDPGConfig, critic_settings_from_checkpoint, install
+    found = critic_settings_from_checkpoint(a.policy_path)
+    if found:                                   # FlowDPG checkpoint: patch so the critic weights load
+        install(FDPGConfig(**found))
+    print(f"checkpoint critic: {found or 'none (plain BC checkpoint)'}", flush=True)
 
     import numpy as np
     import torch

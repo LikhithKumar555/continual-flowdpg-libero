@@ -9,7 +9,6 @@ from __future__ import annotations
 
 import json
 import os
-import shutil
 from pathlib import Path
 
 import numpy as np
@@ -74,44 +73,60 @@ def last_frame_labels(episode_index: np.ndarray, frame_index: np.ndarray):
     return np.array([int(f) == last[int(e)] for e, f in zip(episode_index, frame_index)])
 
 
-def build_demo_dataset(src, episodes: list[int], out_dir: Path, repo_id: str):
-    """Copy `episodes` of the source dataset into out_dir with the shared schema.
+def to_numpy(x) -> np.ndarray:
+    return x.detach().cpu().numpy() if hasattr(x, "detach") else np.asarray(x)
 
-    src: a LeRobotDataset (normally lerobot/libero). Extra source features are dropped,
-    next.reward / next.success / next.done are set on the last frame of every demo.
+
+def build_demo_dataset(episodes: list[int], out_dir: Path, repo_id: str, src_repo: str = SRC_REPO,
+                       src_root=None, log_every: int = 10):
+    """Write `episodes` of the source dataset (lerobot/libero) into a new dataset with the shared schema.
+
+    Frames are read through LeRobot's normal loader and written with the same writer as the rollout
+    collector (rather than copying files with split_dataset, which cannot read lerobot/libero's episode
+    metadata). Extra source features are dropped; next.reward / next.success / next.done are 1 / True
+    on the last frame of every demo. Images are decoded and re-encoded with LeRobot's default encoder,
+    exactly as rollouts are, so demos and rollouts are stored identically.
     """
-    from lerobot.datasets.dataset_tools import modify_features, split_dataset
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     out_dir = Path(out_dir)
-    tmp = out_dir.parent / f"_tmp_split_{out_dir.name}"
     if out_dir.exists():
         raise SystemExit(f"{out_dir} exists; delete it or choose another --out")
-    if tmp.exists():
-        shutil.rmtree(tmp)
-    sub = split_dataset(src, {"demos": sorted(episodes)}, output_dir=tmp)["demos"]
-
+    src = LeRobotDataset(src_repo, root=src_root, episodes=sorted(episodes))
+    features = rollout_features(src.meta.features)
+    cams = [k for k, v in features.items() if v["dtype"] in ("video", "image")]
+    ep_col = np.asarray(src.hf_dataset["episode_index"])
     ep_len: dict[int, int] = {}
-    for e in np.asarray(sub.hf_dataset["episode_index"]):
+    for e in ep_col:
         ep_len[int(e)] = ep_len.get(int(e), 0) + 1
 
-    def is_last(_row, ep, fr):
-        return int(fr) == ep_len[int(ep)] - 1
-
-    keep = set(kept_keys(sub.meta.features)) | DEFAULT_FEATURES
-    remove = [k for k in sub.meta.features if k not in keep]
-    out = modify_features(
-        sub,
-        add_features={
-            REWARD: (lambda r, e, f: np.float32(1.0 if is_last(r, e, f) else 0.0), LABEL_SPECS[REWARD]),
-            SUCCESS: (lambda r, e, f: bool(is_last(r, e, f)), LABEL_SPECS[SUCCESS]),
-            DONE: (lambda r, e, f: bool(is_last(r, e, f)), LABEL_SPECS[DONE]),
-        },
-        remove_features=remove or None,
-        output_dir=out_dir,
-        repo_id=repo_id,
-    )
-    shutil.rmtree(tmp, ignore_errors=True)
-    return out
+    dst = LeRobotDataset.create(repo_id=repo_id, fps=src.meta.fps, features=features, root=out_dir,
+                                robot_type=src.meta.robot_type,
+                                use_videos=any(v["dtype"] == "video" for v in features.values()))
+    n_eps = 0
+    try:
+        for i in range(len(src)):
+            item = src[i]
+            ep, fr = int(item["episode_index"]), int(item["frame_index"])
+            last = fr == ep_len[ep] - 1
+            frame = {k: image_to_uint8_hwc(item[k]) for k in cams}
+            frame[OBS_STATE] = to_numpy(item[OBS_STATE]).astype(np.float32)
+            frame[ACTION] = to_numpy(item[ACTION]).astype(np.float32)
+            frame[REWARD] = np.array([1.0 if last else 0.0], dtype=np.float32)
+            frame[SUCCESS] = np.array([last])
+            frame[DONE] = np.array([last])
+            frame["task"] = item["task"]
+            dst.add_frame(frame)
+            if last:
+                dst.save_episode()
+                n_eps += 1
+                if log_every and n_eps % log_every == 0:
+                    print(f"  {n_eps}/{len(ep_len)} demos written", flush=True)
+    finally:
+        dst.finalize()
+    if n_eps != len(ep_len):
+        raise RuntimeError(f"wrote {n_eps} episodes, expected {len(ep_len)} (episode frames not contiguous?)")
+    return LeRobotDataset(repo_id, root=out_dir)
 
 
 def image_to_uint8_hwc(img) -> np.ndarray:

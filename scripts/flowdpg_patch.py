@@ -57,6 +57,8 @@ class FDPGConfig:
     critic_lr: float = 3e-4
     target_tau: float = 0.005
     hidden: int = 512
+    critic_arch: str = "split"     # "split": separate obs / action projections (default); "concat": one MLP on [obs, act]
+    proj_dim: int = 256            # width of each projection in the split critic
     critic_weight: float = 1.0
     eps: float = 1e-6
 
@@ -70,6 +72,8 @@ class FDPGConfig:
             setattr(cfg, k, typ(v))
         if cfg.mode not in ("flowdpg", "bc_critic"):
             raise SystemExit("--fdpg.mode must be flowdpg or bc_critic")
+        if cfg.critic_arch not in ("split", "concat"):
+            raise SystemExit("--fdpg.critic_arch must be split or concat")
         return cfg
 
     def to_json(self) -> str:
@@ -86,15 +90,67 @@ def _mlp(in_dim: int, hidden: int) -> nn.Sequential:
     )
 
 
-class TwinQ(nn.Module):
-    def __init__(self, cond_dim: int, act_dim: int, hidden: int):
+class SplitQHead(nn.Module):
+    """Q(s, a) with separate projections, so the ~4k-dim observation features cannot drown out
+    the action (168 numbers): obs -> proj_dim, act -> proj_dim, then an MLP on the concatenation."""
+
+    def __init__(self, cond_dim: int, act_dim: int, hidden: int, proj_dim: int):
         super().__init__()
-        self.q1 = _mlp(cond_dim + act_dim, hidden)
-        self.q2 = _mlp(cond_dim + act_dim, hidden)
+        self.obs = nn.Sequential(nn.LayerNorm(cond_dim), nn.Linear(cond_dim, proj_dim),
+                                 nn.LayerNorm(proj_dim), nn.Mish())
+        self.act = nn.Sequential(nn.Linear(act_dim, proj_dim), nn.LayerNorm(proj_dim), nn.Mish())
+        self.mlp = nn.Sequential(
+            nn.Linear(2 * proj_dim, hidden), nn.LayerNorm(hidden), nn.Mish(),
+            nn.Linear(hidden, hidden), nn.LayerNorm(hidden), nn.Mish(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, cond: torch.Tensor, act: torch.Tensor) -> torch.Tensor:
+        return self.mlp(torch.cat([self.obs(cond), self.act(act)], dim=-1))
+
+
+class TwinQ(nn.Module):
+    def __init__(self, cond_dim: int, act_dim: int, hidden: int, arch: str = "split", proj_dim: int = 256):
+        super().__init__()
+        self.arch = arch
+        if arch == "split":
+            self.q1 = SplitQHead(cond_dim, act_dim, hidden, proj_dim)
+            self.q2 = SplitQHead(cond_dim, act_dim, hidden, proj_dim)
+        elif arch == "concat":
+            # parameter names stay q1.<i>/q2.<i> as in the original checkpoints
+            self.q1 = _mlp(cond_dim + act_dim, hidden)
+            self.q2 = _mlp(cond_dim + act_dim, hidden)
+        else:
+            raise ValueError(f"unknown critic arch {arch!r}")
 
     def forward(self, cond: torch.Tensor, act: torch.Tensor):
-        x = torch.cat([cond, act], dim=-1)
-        return self.q1(x).squeeze(-1), self.q2(x).squeeze(-1)
+        if self.arch == "concat":
+            x = torch.cat([cond, act], dim=-1)
+            return self.q1(x).squeeze(-1), self.q2(x).squeeze(-1)
+        return self.q1(cond, act).squeeze(-1), self.q2(cond, act).squeeze(-1)
+
+
+def critic_settings_from_checkpoint(pretrained_dir) -> dict:
+    """Read the critic architecture of a saved checkpoint from its weight names / shapes.
+
+    Returns {} if the checkpoint has no FlowDPG critic (plain BC), else
+    {"critic_arch": ..., "hidden": ..., ("proj_dim": ...)} to pass into FDPGConfig.
+    """
+    from pathlib import Path
+
+    from safetensors import safe_open
+
+    path = Path(pretrained_dir) / "model.safetensors"
+    with safe_open(str(path), framework="pt") as f:
+        keys = set(f.keys())
+        if not any(k.startswith("fdpg_q.") for k in keys):
+            return {}
+        if "fdpg_q.q1.obs.1.weight" in keys:
+            proj, _ = f.get_slice("fdpg_q.q1.obs.1.weight").get_shape()
+            hidden, _ = f.get_slice("fdpg_q.q1.mlp.0.weight").get_shape()
+            return {"critic_arch": "split", "hidden": int(hidden), "proj_dim": int(proj)}
+        hidden, _ = f.get_slice("fdpg_q.q1.1.weight").get_shape()
+        return {"critic_arch": "concat", "hidden": int(hidden)}
 
 
 class ValueNet(nn.Module):
@@ -200,7 +256,7 @@ def _make_init(orig_init, hp: FDPGConfig):
         orig_init(self, config, **kwargs)
         cond_dim = self.observation_encoder.conditioning_dim
         act_dim = config.action_feature.shape[0] * config.n_action_steps
-        self.fdpg_q = TwinQ(cond_dim, act_dim, hp.hidden)
+        self.fdpg_q = TwinQ(cond_dim, act_dim, hp.hidden, arch=hp.critic_arch, proj_dim=hp.proj_dim)
         self.fdpg_q_target = copy.deepcopy(self.fdpg_q)
         for p in self.fdpg_q_target.parameters():
             p.requires_grad_(False)

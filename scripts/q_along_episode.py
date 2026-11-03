@@ -24,12 +24,14 @@ def main():
     ap.add_argument("--root", default=None, help="local dataset folder (default: lerobot/libero from the Hub)")
     ap.add_argument("--episodes", type=int, nargs="+", required=True)
     ap.add_argument("--out", required=True, help="PNG path; the CSV goes next to it")
-    ap.add_argument("--fdpg_hidden", type=int, default=512)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--device", default="cuda")
     a = ap.parse_args()
 
-    fp.install(fp.FDPGConfig(hidden=a.fdpg_hidden))
+    found = fp.critic_settings_from_checkpoint(a.policy_path)
+    if not found:
+        raise SystemExit("this checkpoint has no FlowDPG critic (plain BC run?)")
+    fp.install(fp.FDPGConfig(**found))
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt

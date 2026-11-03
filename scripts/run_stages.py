@@ -30,7 +30,6 @@ RES = ["--env.observation_height=256", "--env.observation_width=256"]  # MUST ma
 POLICY_FLAGS = [
     "--policy.type=multi_task_dit",
     "--policy.objective=flow_matching",
-    "--policy.timestep_sampling_strategy=beta",
     "--policy.num_integration_steps=10",
     "--policy.integration_method=euler",
     "--policy.num_layers=4",
@@ -111,9 +110,25 @@ def main():
     ap.add_argument("--eval_episodes", type=int, default=50)
     ap.add_argument("--eval_batch", type=int, default=10)
     ap.add_argument("--out", default=str(WORK / "runs"))
+    ap.add_argument("--timestep", default="beta", choices=["beta", "uniform"],
+                    help="flow-time sampling in training (LeRobot default beta; FlowDPG paper: uniform)")
     ap.add_argument("--dry_run", action="store_true")
     a = ap.parse_args()
-    a.method = a.method or f"{a.algo}_cumulative_scratch"
+    if a.method is None:
+        # Every setting that changes training goes into the run id, so new runs never collide with
+        # (and get skipped because of) finished runs of an older configuration.
+        a.method = f"{a.algo}_cumulative_scratch"
+        if a.algo != "bc":
+            arch = next((kv.split("=", 1)[1] for kv in a.fdpg if kv.startswith("critic_arch=")), "split")
+            if arch == "split":
+                a.method += "_split"
+        if a.timestep == "uniform":
+            a.method += "_tu"
+        if a.steps != 10000:
+            a.method += f"_{a.steps // 1000}k"
+        extra = [kv.replace("=", "") for kv in a.fdpg if not kv.startswith("critic_arch=")]
+        if extra:
+            a.method += "_" + "_".join(extra)
     if a.algo == "bc":
         if a.fdpg:
             raise SystemExit("--fdpg settings need --algo flowdpg or bc_critic")
@@ -173,6 +188,7 @@ def main():
             cmd = [*train_prefix, "--dataset.repo_id=lerobot/libero",
                    f"--dataset.episodes=[{','.join(map(str, eps))}]",
                    f"--output_dir={out_dir}", f"--seed={a.seed}", *POLICY_FLAGS,
+                   f"--policy.timestep_sampling_strategy={a.timestep}",
                    f"--batch_size={a.batch_size}", f"--steps={a.steps}",
                    f"--save_freq={a.steps}", "--log_freq=100", "--wandb.enable=false"]
             rc = run(cmd, root / "logs" / f"train_stage{m}.log", a.dry_run, run_id)

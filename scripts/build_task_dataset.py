@@ -23,8 +23,6 @@ def main():
     ap.add_argument("--repo_id", default=None, help="default: local/<out folder name>")
     a = ap.parse_args()
 
-    from lerobot.datasets.lerobot_dataset import LeRobotDataset
-
     eps = []
     for t in a.task_ids:
         text, e = ld.episodes_for_env_task(a.suite, t)
@@ -32,7 +30,7 @@ def main():
         eps += e
     out = Path(a.out)
     repo_id = a.repo_id or f"local/{out.name}"
-    ds = ld.build_demo_dataset(LeRobotDataset(ld.SRC_REPO), eps, out, repo_id)
+    ds = ld.build_demo_dataset(eps, out, repo_id)
     print(f"wrote {ds.meta.total_episodes} episodes / {ds.meta.total_frames} frames -> {out}")
     print("features:", sorted(ds.meta.features))
     print(f"train with: --dataset.repo_id={repo_id} --dataset.root={out}")
