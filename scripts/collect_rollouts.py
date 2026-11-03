@@ -106,7 +106,7 @@ def main():
     def keep_action(act):
         act_steps.append(act.detach().cpu() if hasattr(act, "detach") else act)
 
-    ds = LeRobotDataset.create(repo_id=a.repo_id or f"local/{out.name}", fps=src_meta.fps, features=features,
+    ds = LeRobotDataset.create(repo_id=a.repo_id or f"local/{out.name}", fps=int(round(src_meta.fps)), features=features,
                                root=out, robot_type=src_meta.robot_type,
                                use_videos=any(v["dtype"] == "video" for v in features.values()))
     task = list(vec_env.call("task_description"))[0]

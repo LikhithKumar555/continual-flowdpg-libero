@@ -100,7 +100,7 @@ def build_demo_dataset(episodes: list[int], out_dir: Path, repo_id: str, src_rep
     for e in ep_col:
         ep_len[int(e)] = ep_len.get(int(e), 0) + 1
 
-    dst = LeRobotDataset.create(repo_id=repo_id, fps=src.meta.fps, features=features, root=out_dir,
+    dst = LeRobotDataset.create(repo_id=repo_id, fps=int(round(src.meta.fps)), features=features, root=out_dir,
                                 robot_type=src.meta.robot_type,
                                 use_videos=any(v["dtype"] == "video" for v in features.values()))
     n_eps = 0
