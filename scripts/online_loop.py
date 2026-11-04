@@ -49,6 +49,24 @@ def run(cmd, log: Path, dry: bool) -> None:
         raise SystemExit(f"failed (exit {rc}): see {log}")
 
 
+def stats_shift(ref: Path, new: Path) -> str:
+    """Largest relative change of the min/max range of state and action between two stats files,
+    in units of the reference range (0 = identical scaling)."""
+    a, b = json.loads(Path(ref).read_text()), json.loads(Path(new).read_text())
+    parts = []
+    for key in ("observation.state", "action"):
+        if key not in a or key not in b or "min" not in a[key]:
+            continue
+        lo_a, hi_a = a[key]["min"], a[key]["max"]
+        lo_b, hi_b = b[key]["min"], b[key]["max"]
+        worst = 0.0
+        for la, ha, lb, hb in zip(lo_a, hi_a, lo_b, hi_b):
+            rng = max(ha - la, 1e-8)
+            worst = max(worst, abs(lb - la) / rng, abs(hb - ha) / rng)
+        parts.append(f"{key} up to {100 * worst:.0f}% of its range")
+    return "; ".join(parts) or "n/a"
+
+
 def ckpt_of(train_dir: Path, steps: int) -> Path:
     return train_dir / "checkpoints" / f"{steps:06d}" / "pretrained_model"
 
@@ -72,6 +90,9 @@ def main():
                     help="FlowDPG settings for the offline round, e.g. alpha=0.25 (kept by warm starts)")
     ap.add_argument("--extra_rollouts", nargs="*", default=[],
                     help="already collected rollout datasets to include from round 1 on")
+    ap.add_argument("--recompute_stats", action="store_true",
+                    help="let each round renormalise with the merged data's stats (old behaviour; "
+                         "default keeps the demo stats fixed)")
     ap.add_argument("--dry_run", action="store_true")
     a = ap.parse_args()
     if a.collect_episodes % a.env_batch or a.eval_episodes % a.env_batch:
@@ -118,10 +139,20 @@ def main():
             raise SystemExit(f"could not parse eval result: {log}")
         return int(m[-1][0]), int(m[-1][1])
 
+    def n_collected(data_dir: Path) -> int:
+        f = data_dir / "episodes.jsonl"
+        return sum(1 for _ in open(f)) if f.exists() else 0
+
     def collect(ckpt: Path, data_dir: Path, r: int) -> dict:
-        if not (data_dir / "episodes.jsonl").exists():
+        # An interrupted collection still writes episodes.jsonl (for the episodes it finished),
+        # so only a full set counts as done; anything else is deleted and collected again.
+        if n_collected(data_dir) != a.collect_episodes:
             if data_dir.exists() and not a.dry_run:
+                print(f"   discarding incomplete collection {data_dir} ({n_collected(data_dir)} episodes)", flush=True)
                 shutil.rmtree(data_dir)
+            merged = out / f"data_r{r}"
+            if merged.exists() and not a.dry_run:      # built from the incomplete collection
+                shutil.rmtree(merged)
             run([py, HERE / "collect_rollouts.py", f"--policy_path={ckpt}", f"--suite={a.suite}",
                  f"--task_id={a.task_id}", f"--n_episodes={a.collect_episodes}", f"--batch_size={a.env_batch}",
                  f"--seed={100000 * (a.seed + 1) + 1000 * r}", f"--out={data_dir}"],
@@ -132,12 +163,21 @@ def main():
         return {"collect_success": sum(e["success"] for e in eps), "collect_episodes": len(eps)}
 
     def merge(inputs: list[Path], data_dir: Path, r: int):
-        if (data_dir / "meta" / "info.json").exists():
+        if not (data_dir / "meta" / "info.json").exists():
+            if data_dir.exists() and not a.dry_run:
+                shutil.rmtree(data_dir)
+            run([py, HERE / "merge_data.py", "--inputs", *inputs, "--out", data_dir],
+                out / "logs" / f"merge_r{r}.log", a.dry_run)
+        if a.recompute_stats or a.dry_run:
             return
-        if data_dir.exists() and not a.dry_run:
-            shutil.rmtree(data_dir)
-        run([py, HERE / "merge_data.py", "--inputs", *inputs, "--out", data_dir],
-            out / "logs" / f"merge_r{r}.log", a.dry_run)
+        # Warm-started lerobot-train replaces the checkpoint's normalisation with the training
+        # dataset's stats. Keep the round-0 (demo) stats so the weights see the same scaling.
+        stats, demo_stats = data_dir / "meta" / "stats.json", demos / "meta" / "stats.json"
+        backup = data_dir / "meta" / "stats_merged.json"
+        if not backup.exists():
+            shutil.copy(stats, backup)
+            print("   normalisation shift the merge would have caused:", stats_shift(demo_stats, backup), flush=True)
+        shutil.copy(demo_stats, stats)
 
     def record(rec: dict):
         done[rec["round"]] = rec
