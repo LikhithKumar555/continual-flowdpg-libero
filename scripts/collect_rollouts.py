@@ -103,8 +103,14 @@ def main():
         obs_steps.append({k: o[k].detach().cpu() if hasattr(o[k], "detach") else o[k]
                           for k in cam_keys + [ld.OBS_STATE]})
 
+    # Store what the robot actually executes: the environment clips actions to its action space, so
+    # the raw policy output (e.g. gripper 1.07) would otherwise be imitated as an out-of-range target.
+    act_low = torch.as_tensor(np.asarray(vec_env.single_action_space.low), dtype=torch.float32)
+    act_high = torch.as_tensor(np.asarray(vec_env.single_action_space.high), dtype=torch.float32)
+
     def keep_action(act):
-        act_steps.append(act.detach().cpu() if hasattr(act, "detach") else act)
+        t = act.detach().cpu().float() if hasattr(act, "detach") else torch.as_tensor(act, dtype=torch.float32)
+        act_steps.append(torch.max(torch.min(t, act_high), act_low))
 
     ds = LeRobotDataset.create(repo_id=a.repo_id or f"local/{out.name}", fps=int(round(src_meta.fps)), features=features,
                                root=out, robot_type=src_meta.robot_type,

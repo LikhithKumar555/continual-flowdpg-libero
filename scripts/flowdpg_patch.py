@@ -61,6 +61,7 @@ class FDPGConfig:
     proj_dim: int = 256            # width of each projection in the split critic
     critic_weight: float = 1.0
     actor_data: str = "success"    # actor learns from "success" episodes only (critic: all data), or "all"
+    clamp_actions: bool = True     # clamp normalised action targets to [-1, 1] (= demo range with demo stats)
     eps: float = 1e-6
 
     @classmethod
@@ -70,7 +71,12 @@ class FDPGConfig:
             if not hasattr(cfg, k):
                 raise SystemExit(f"unknown --fdpg.{k}; valid: {list(asdict(cfg))}")
             typ = type(getattr(cfg, k))
-            setattr(cfg, k, typ(v))
+            if typ is bool:
+                if str(v).lower() not in ("true", "false", "1", "0", "yes", "no"):
+                    raise SystemExit(f"--fdpg.{k} must be true or false, got {v!r}")
+                setattr(cfg, k, str(v).lower() in ("true", "1", "yes"))
+            else:
+                setattr(cfg, k, typ(v))
         if cfg.mode not in ("flowdpg", "bc_critic"):
             raise SystemExit("--fdpg.mode must be flowdpg or bc_critic")
         if cfg.critic_arch not in ("split", "concat"):
@@ -351,6 +357,10 @@ def _forward(self, batch: dict, reduction: str = "mean"):
     c = cond.detach()
 
     data = batch[ACTION]                             # (B, H, A), normalised
+    if hp.clamp_actions:
+        # MIN_MAX-normalised with the demo stats (kept fixed across online rounds), so [-1, 1] is the
+        # demo range: never regress towards (or score) actions outside what the demos did.
+        data = data.clamp(-1.0, 1.0)
     bsz = data.shape[0]
     a_exec = data[:, s:s + k].reshape(bsz, -1)
 
