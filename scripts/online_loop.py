@@ -90,6 +90,9 @@ def main():
                     help="FlowDPG settings for the offline round, e.g. alpha=0.25 (kept by warm starts)")
     ap.add_argument("--extra_rollouts", nargs="*", default=[],
                     help="already collected rollout datasets to include from round 1 on")
+    ap.add_argument("--actor_demos_only", action="store_true",
+                    help="the actor learns only from the demo frames (they come first in every merged "
+                         "dataset); rollouts, failures included, train only the critic")
     ap.add_argument("--recompute_stats", action="store_true",
                     help="let each round renormalise with the merged data's stats (old behaviour; "
                          "default keeps the demo stats fixed)")
@@ -108,6 +111,11 @@ def main():
             done[r["round"]] = r
     py = sys.executable
 
+    def demo_frames() -> int:
+        if a.dry_run and not (demos / "meta" / "info.json").exists():
+            return 4487
+        return int(json.loads((demos / "meta" / "info.json").read_text())["total_frames"])
+
     def train(data_dir: Path, train_dir: Path, steps: int, init: Path | None, tag: str):
         if ckpt_of(train_dir, steps).exists():
             return
@@ -116,6 +124,8 @@ def main():
         # --fdpg settings apply to every round (warm starts too); the critic architecture of a warm
         # start is read from its checkpoint by the launcher.
         cmd = [py, LAUNCHER, "train"] + [f"--fdpg.{kv}" for kv in a.fdpg]
+        if a.actor_demos_only:
+            cmd.append(f"--fdpg.actor_max_index={demo_frames()}")
         if init is None:
             cmd += POLICY + [f"--policy.timestep_sampling_strategy={a.timestep}"]
         else:
