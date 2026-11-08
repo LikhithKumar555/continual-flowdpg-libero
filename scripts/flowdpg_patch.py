@@ -62,6 +62,7 @@ class FDPGConfig:
     critic_weight: float = 1.0
     actor_data: str = "success"    # actor learns from "success" episodes only (critic: all data), or "all"
     clamp_actions: bool = True     # clamp normalised action targets to [-1, 1] (= demo range with demo stats)
+    binarize_gripper: bool = True  # gripper target (last action dim) -> -1/+1 by sign, like the demos
     eps: float = 1e-6
 
     @classmethod
@@ -361,6 +362,11 @@ def _forward(self, batch: dict, reduction: str = "mean"):
         # MIN_MAX-normalised with the demo stats (kept fixed across online rounds), so [-1, 1] is the
         # demo range: never regress towards (or score) actions outside what the demos did.
         data = data.clamp(-1.0, 1.0)
+    if hp.binarize_gripper:
+        # Demo gripper commands are exactly -1/+1 (normalised: the same, with the demo stats).
+        # Rollouts recorded the policy's in-between values; train on the decision, not the blur.
+        data = data.clone()
+        data[..., -1] = torch.where(data[..., -1] >= 0, 1.0, -1.0)
     bsz = data.shape[0]
     a_exec = data[:, s:s + k].reshape(bsz, -1)
 

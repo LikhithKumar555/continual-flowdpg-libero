@@ -49,6 +49,8 @@ def main():
     ap.add_argument("--out", required=True)
     ap.add_argument("--repo_id", default=None)
     ap.add_argument("--device", default="cuda")
+    ap.add_argument("--binarize_gripper", action=argparse.BooleanOptionalAction, default=True,
+                    help="store the gripper command as -1/+1 by its sign, like the demos")
     a = ap.parse_args()
 
     if a.n_episodes % a.batch_size:
@@ -110,7 +112,13 @@ def main():
 
     def keep_action(act):
         t = act.detach().cpu().float() if hasattr(act, "detach") else torch.as_tensor(act, dtype=torch.float32)
-        act_steps.append(torch.max(torch.min(t, act_high), act_low))
+        t = torch.max(torch.min(t, act_high), act_low)
+        if a.binarize_gripper:
+            # Demos command the gripper fully open/closed (exactly -1/+1). The flow policy's output is
+            # often in between; imitating that makes the gripper ever softer, round after round.
+            t = t.clone()
+            t[..., -1] = torch.where(t[..., -1] >= 0, 1.0, -1.0)
+        act_steps.append(t)
 
     ds = LeRobotDataset.create(repo_id=a.repo_id or f"local/{out.name}", fps=int(round(src_meta.fps)), features=features,
                                root=out, robot_type=src_meta.robot_type,
