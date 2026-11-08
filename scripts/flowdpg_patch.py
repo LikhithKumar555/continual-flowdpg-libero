@@ -63,6 +63,8 @@ class FDPGConfig:
     actor_data: str = "success"    # actor learns from "success" episodes only (critic: all data), or "all"
     clamp_actions: bool = True     # clamp normalised action targets to [-1, 1] (= demo range with demo stats)
     binarize_gripper: bool = True  # gripper target (last action dim) -> -1/+1 by sign, like the demos
+    actor_max_index: int = 0       # >0: actor learns only from frames with global index < this (diagnostic:
+                                   # in a merged dataset the demos come first, so this = "demos only")
     eps: float = 1e-6
 
     @classmethod
@@ -241,6 +243,16 @@ EP_SUCCESS = "episode_success"
 def actor_weights(batch: dict, bsz: int, hp: "FDPGConfig", device) -> torch.Tensor:
     """Per-sample actor weights (B,). 1 everywhere unless actor_data="success" and the dataset
     has an episode_success column, then 1 for frames of successful episodes and 0 otherwise."""
+    w = _success_weights(batch, bsz, hp, device)
+    if hp.actor_max_index > 0:
+        if "index" not in batch:
+            raise RuntimeError("actor_max_index set but the batch has no 'index' column")
+        idx = batch["index"].reshape(bsz, -1)[:, 0].to(device)
+        w = w * (idx < hp.actor_max_index).float()
+    return w
+
+
+def _success_weights(batch: dict, bsz: int, hp: "FDPGConfig", device) -> torch.Tensor:
     ones = torch.ones(bsz, device=device)
     if hp.actor_data == "all":
         return ones
