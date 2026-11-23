@@ -285,6 +285,7 @@ def test_forward_uses_data_reward_when_present():
     rew = torch.zeros(8, K, 1)
     rew[:3, -1] = 1.0
     b[fp.REWARD] = rew
+    b[fp.EP_SUCCESS] = torch.ones(8, 1)          # our datasets always carry the flag with the reward
     _, info = pol(b)
     assert info["fdpg_reward_from_data"] == 1.0
     assert info["fdpg_done_frac"] == pytest.approx(3 / 8)
