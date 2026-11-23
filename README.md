@@ -84,6 +84,9 @@ scripts/
   build_task_dataset.py    demos of chosen tasks -> local dataset with reward/success/done labels
   collect_rollouts.py      run a policy in LIBERO, save every episode (incl. failures) in that schema
   merge_data.py            merge demos + rollout rounds into one training dataset
+  continual.py             the Overview's continual loop on a task sequence, online phase per task,
+                           five methods (see below)
+  warm_start.py            carries a checkpoint's optimizer state into the next lerobot-train run
   q_along_episode.py       critic diagnostic: Q and V along demos / rollouts vs gamma^(steps to success)
 src/cfdpg/                 results store, metrics, heatmap, samplers, dataset manifest
 tests/                     59 tests (metrics, samplers, runner, FlowDPG patch on a stand-in, rollout frames)
@@ -139,3 +142,38 @@ Rollouts record the observation exactly as the policy sees it after LeRobot's LI
 Tests: `pip install numpy matplotlib pytest torch && python -m pytest`. The dataset pipeline
 (build -> record -> merge -> load with the patch's reward window) was also checked end to end with
 LeRobot's dataset code on synthetic data; collection inside the LIBERO simulator is untested outside fafnir.
+
+## Continual experiment (`scripts/continual.py`)
+
+The Overview's loop on LIBERO-Spatial, with an online phase per task. For each task m:
+zero-shot eval on m, add m's demos, offline training, up to `--rounds` online rounds
+(collect 50 rollouts of m, add them, keep training, eval m), save the stage manifest, then
+evaluate every task so far (one row of the triangle). One run = one method, one order, one seed.
+
+| `--method` | start of each stage | training data |
+| --- | --- | --- |
+| `fdpg_cumulative` (main) | previous stage: policy, critic and optimizer state | demos 1..m + all rollouts so far |
+| `bc_cumulative` | same | same; actor is plain BC |
+| `fdpg_current` | same | demos + rollouts of task m only |
+| `fdpg_cold` | fresh init (same seed) every stage | demos 1..m + all rollouts so far |
+| `fixed` | trains stage 1 only, then never updates | - |
+
+Fixed choices: the actor learns only from demo frames (rollouts train the critic); uniform sampling
+over frames; normalisation stats of all demos in `--order`, fixed for the whole run; eval env seed 0
+for every cell, collection seeds >= 1,000,000; each stage starts a fresh LR schedule but keeps
+the Adam moments. All methods get the same steps, rounds and episodes per stage.
+
+```bash
+export DATA=/media/internal/hdd/$USER/data
+# pilot: 3 tasks, 10 rollouts per cell, 1 seed
+python scripts/continual.py --method fdpg_cumulative --suite libero_spatial --order 0 1 2 --seed 0
+python scripts/continual.py --method fdpg_cumulative --order 0 1 2 --dry_run    # print the plan only
+python scripts/report.py $DATA/continual/<run_id>/cells.jsonl
+```
+Defaults: 10k offline steps, 4 rounds x 5k steps, 50 episodes per collection, 10 per round eval
+and per triangle cell. `--target 0.9` ends a task's online phase early once its round eval reaches 90%.
+Output per run: `cells.jsonl` (triangle, entry = zero-shot), `online.jsonl` (every round),
+`stages.jsonl` + `stage<m>/manifest.json` (data, init, steps, wall time, peak GPU memory),
+`config.json` (all settings + git commit). Restartable; round checkpoints and merged datasets
+are deleted once used (`--keep_all` keeps them).
+
