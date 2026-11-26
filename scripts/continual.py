@@ -36,6 +36,13 @@ Design decisions (documented here because they change results):
   * Each stage starts a fresh learning-rate schedule; only the optimizer's per-parameter state
     (Adam moments) is carried over (warm_start.py).
 
+Saving GPU time and sharing the GPU:
+  --stage0_from <run dir>  reuse stage 0 of a finished run with the same settings (its stage 0 is
+                           identical for fixed, fdpg_cold, fdpg_current and fdpg_cumulative). Only
+                           its records are copied; checkpoints and rollouts are read in place.
+  --avoid "Mon,Thu,Fri 14:00-17:00"  (default) never run a job that would overlap these hours;
+                           the runner sleeps until the window ends. --avoid none disables it.
+
 Restartable: finished trainings, collections and evaluations are skipped on re-run.
 Disk: intermediate round checkpoints and merged datasets are deleted once they are no longer
 needed (--keep_all keeps them); the final checkpoint of every stage is kept.
@@ -49,6 +56,7 @@ import shutil
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -91,6 +99,42 @@ def collect_seed(seed: int, stage: int, rnd: int) -> int:
     return 1_000_000 * (seed + 1) + 10_000 * stage + 1_000 * rnd
 
 
+DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
+# rough job lengths on fafnir's RTX 4090 (pilot: 5k steps = 2,600 s), used only to avoid the windows
+SEC_PER_STEP = 0.53
+
+
+def parse_windows(spec: str) -> list[tuple[int, int, int]]:
+    """'Mon,Thu 14:00-17:00; Fri 09:00-10:00' -> [(weekday, start_min, end_min), ...]."""
+    out = []
+    if not spec or spec.strip().lower() == "none":
+        return out
+    for part in spec.split(";"):
+        days, _, hours = part.strip().partition(" ")
+        lo, _, hi = hours.strip().partition("-")
+        start = int(lo.split(":")[0]) * 60 + int(lo.split(":")[1])
+        end = int(hi.split(":")[0]) * 60 + int(hi.split(":")[1])
+        if end <= start:
+            raise ValueError(f"bad window {part!r}: end must be after start")
+        for d in days.split(","):
+            out.append((DAYS.index(d.strip()[:3].capitalize()), start, end))
+    return out
+
+
+def blocked_until(now: datetime, expected_s: float, windows) -> datetime | None:
+    """If a job starting now and lasting expected_s would overlap a window, the window's end."""
+    job_end = now + timedelta(seconds=expected_s)
+    for day_offset in range(0, 3):
+        day = (now + timedelta(days=day_offset)).replace(hour=0, minute=0, second=0, microsecond=0)
+        for wd, start, end in windows:
+            if day.weekday() != wd:
+                continue
+            w0, w1 = day + timedelta(minutes=start), day + timedelta(minutes=end)
+            if now < w1 and job_end > w0:
+                return w1
+    return None
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--method", required=True, choices=sorted(METHODS))
@@ -115,6 +159,9 @@ def main():
     ap.add_argument("--timestep", default="uniform", choices=["uniform", "beta"])
     ap.add_argument("--fdpg", nargs="*", default=[], metavar="KEY=VALUE", help="extra FlowDPG settings")
     ap.add_argument("--keep_all", action="store_true", help="keep round checkpoints and merged datasets")
+    ap.add_argument("--stage0_from", default=None, help="reuse stage 0 of this finished run directory")
+    ap.add_argument("--avoid", default="Mon,Thu,Fri 14:00-17:00",
+                    help="hours when no job may run (GPU reserved for others); 'none' to disable")
     ap.add_argument("--dry_run", action="store_true", help="print the commands only")
     a = ap.parse_args()
     for n in (a.collect_episodes, a.eval_episodes, a.round_eval_episodes):
@@ -125,6 +172,7 @@ def main():
     if a.target is not None and a.round_eval_episodes == 0:
         raise SystemExit("--target needs --round_eval_episodes > 0")
 
+    windows = parse_windows(a.avoid)
     mode, warm, scope = METHODS[a.method]
     order_s = "-".join(map(str, a.order))
     run_id = f"{a.method}_{a.suite}_o{order_s}_s{a.seed}" + (f"_{a.tag}" if a.tag else "")
@@ -159,6 +207,16 @@ def main():
         if rc != 0:
             raise SystemExit(f"failed (exit {rc}): see {log}")
         return log.read_text()
+
+    def wait_for_gpu(expected_s: float, what: str):
+        """Sleep while a job of this length would overlap a reserved window."""
+        while not dry:
+            until = blocked_until(datetime.now(), expected_s, windows)
+            if until is None:
+                return
+            print(f"   {datetime.now():%a %H:%M}: {what} (~{expected_s / 60:.0f} min) would overlap the "
+                  f"reserved GPU hours; waiting until {until:%a %H:%M}", flush=True)
+            time.sleep(max(60.0, (until - datetime.now()).total_seconds() + 60))
 
     def rm(p: Path):
         if not a.keep_all and p.exists() and not dry:
@@ -205,6 +263,7 @@ def main():
         key = (str(ckpt), task_id, n)
         if key in evals:
             return evals[key]["n"], evals[key]["k"]
+        wait_for_gpu(120 + 30 * n, f"eval {tag}")
         text = run([py, LAUNCHER, "eval", f"--policy.path={ckpt}", "--env.type=libero",
                     f"--env.task={a.suite}", f"--env.task_ids=[{task_id}]", *RES,
                     f"--eval.batch_size={a.env_batch}", f"--eval.n_episodes={n}", "--seed=0",
@@ -241,6 +300,7 @@ def main():
                 f"--output_dir={train_dir}", f"--seed={a.seed}", "--policy.device=cuda",
                 "--policy.push_to_hub=false", f"--batch_size={a.batch_size}", f"--steps={steps}",
                 f"--save_freq={steps}", "--log_freq=100", "--wandb.enable=false"]
+        wait_for_gpu(300 + SEC_PER_STEP * steps, f"training {tag}")
         t0 = time.time()
         text = run(cmd, root / "logs" / f"train_{tag}.log")
         peak = PEAK_RE.findall(text)
@@ -255,6 +315,7 @@ def main():
         if n_done != a.collect_episodes:        # interrupted collections are redone completely
             if out.exists() and not dry:
                 shutil.rmtree(out)
+            wait_for_gpu(120 + 30 * a.collect_episodes, f"collection s{stage} r{rnd}")
             run([py, HERE / "collect_rollouts.py", f"--policy_path={ckpt}", f"--suite={a.suite}",
                  f"--task_id={task_id}", f"--n_episodes={a.collect_episodes}",
                  f"--batch_size={a.env_batch}", f"--seed={collect_seed(a.seed, stage, rnd)}",
@@ -294,6 +355,44 @@ def main():
                                                       "warm": warm, "scope": scope,
                                                       "git_commit": git_commit()}, indent=2))
 
+    def reuse_stage0(src: Path):
+        """Copy stage 0's records from a finished run with identical stage-0 settings."""
+        cfg = json.loads((src / "config.json").read_text())
+        same = ["suite", "seed", "offline_steps", "rounds", "online_steps", "collect_episodes",
+                "round_eval_episodes", "target", "eval_episodes", "batch_size", "timestep", "fdpg"]
+        diff = [k for k in same if cfg.get(k) != getattr(a, k)]
+        if cfg.get("fdpg_mode") != mode:
+            diff.append("fdpg mode")
+        if sorted(cfg["order"]) != sorted(a.order) or cfg["order"][0] != a.order[0]:
+            diff.append("order (same first task and same task set needed)")
+        if diff:
+            raise SystemExit(f"--stage0_from {src}: settings differ ({', '.join(diff)})")
+        src_stage = next((r for r in map(json.loads, open(src / "stages.jsonl")) if r["stage"] == 0), None)
+        if src_stage is None:
+            raise SystemExit(f"--stage0_from {src}: stage 0 is not finished there")
+        final = Path(src_stage["final_ckpt"])
+        if warm and a.method != "fixed" and len(a.order) > 1 and not (final.parent / "training_state").exists():
+            raise SystemExit(f"--stage0_from {src}: its stage-0 optimizer state is gone (deleted after its "
+                             f"stage 1), and {a.method} warm-starts from it. Run without --stage0_from.")
+        under = str(src / "stage0")
+        for e in map(json.loads, open(src / "evals.jsonl")):
+            if e["ckpt"].startswith(under) and (e["ckpt"], e["task_id"], e["n"]) not in evals:
+                evals[(e["ckpt"], e["task_id"], e["n"])] = e
+                append("evals.jsonl", e)
+        for r in map(json.loads, open(src / "online.jsonl")):
+            if r["stage"] == 0:
+                rounds_done[(0, r["round"])] = r
+                append("online.jsonl", r)
+        for c in map(json.loads, open(src / "cells.jsonl")):
+            if c["stage"] == 0:
+                cell(0, c["task"], c["kind"], (c["n_rollouts"], c["successes"]))
+        rec = {**src_stage, "method": a.method, "run_id": run_id, "reused_from": str(src)}
+        (root / "stage0").mkdir(parents=True, exist_ok=True)
+        (root / "stage0" / "manifest.json").write_text(json.dumps(rec, indent=2))
+        stages[0] = rec
+        append("stages.jsonl", rec)
+        print(f"   stage 0 reused from {src}", flush=True)
+
     def cell(stage, pos, kind, nk):
         if (stage, pos, kind) in cells:
             return
@@ -301,6 +400,9 @@ def main():
                    task=pos, kind=kind, n_rollouts=nk[0], successes=nk[1])
         cells[(stage, pos, kind)] = rec
         append("cells.jsonl", rec)
+
+    if a.stage0_from and 0 not in stages and not dry:
+        reuse_stage0(Path(a.stage0_from))
 
     all_rollouts: list[Path] = []     # every rollout dataset of this run, in collection order
     prev_final: Path | None = None
@@ -343,7 +445,8 @@ def main():
                          "ckpt": str(ckpt_of(tdir, a.offline_steps)), **cost}
                 if data.parent == sdir:
                     rm(data)
-                if init is not None and not a.keep_all and not dry:  # the old optimizer state is used up
+                if (init is not None and not a.keep_all and not dry  # the old optimizer state is used up
+                        and root in init.parents):                   # (never another run's files)
                     shutil.rmtree(init.parent / "training_state", ignore_errors=True)
                 if a.round_eval_episodes:
                     n, k = evaluate(Path(rinfo["ckpt"]), task_id, a.round_eval_episodes, f"round_s{m}_r0")
