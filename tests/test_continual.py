@@ -129,3 +129,67 @@ def test_collection_seeds_are_disjoint_from_eval(tmp_path):
 def test_target_needs_round_evals(tmp_path):
     with pytest.raises(subprocess.CalledProcessError):
         dry("fdpg_cumulative", tmp_path, "--target", "0.9", "--round_eval_episodes", "0")
+
+
+# ---------------------------------------------------------------- GPU windows and stage-0 reuse
+import json  # noqa: E402
+from datetime import datetime  # noqa: E402
+
+import continual  # noqa: E402
+
+
+def test_windows_block_jobs_that_would_overlap():
+    w = continual.parse_windows("Mon,Thu,Fri 14:00-17:00")
+    thu = datetime(2026, 11, 26, 12, 0)                        # a Thursday
+    assert continual.blocked_until(thu, 3600, w) is None        # ends 13:00
+    assert continual.blocked_until(thu, 3 * 3600, w) == datetime(2026, 11, 26, 17, 0)
+    assert continual.blocked_until(datetime(2026, 11, 26, 15, 0), 60, w) == datetime(2026, 11, 26, 17, 0)
+    assert continual.blocked_until(datetime(2026, 11, 25, 12, 0), 3 * 3600, w) is None   # Wednesday
+    # a long job on Wednesday night runs into Thursday afternoon
+    assert continual.blocked_until(datetime(2026, 11, 25, 23, 0), 16 * 3600, w) == datetime(2026, 11, 26, 17, 0)
+    assert continual.parse_windows("none") == []
+
+
+def fake_run(root: Path, order, **over):
+    root.mkdir(parents=True)
+    cfg = dict(suite="libero_spatial", seed=0, offline_steps=10000, rounds=4, online_steps=5000,
+               collect_episodes=50, round_eval_episodes=10, target=None, eval_episodes=10, batch_size=32,
+               timestep="uniform", fdpg=[], fdpg_mode="flowdpg", order=order)
+    cfg.update(over)
+    (root / "config.json").write_text(json.dumps(cfg))
+    final = root / "stage0" / "train_r4" / "checkpoints" / "005000" / "pretrained_model"
+    (root / "stages.jsonl").write_text(json.dumps({"stage": 0, "task_id": order[0], "final_ckpt": str(final),
+                                                   "rollouts": [], "gradient_steps_total": 30000}) + "\n")
+    (root / "online.jsonl").write_text(json.dumps({"stage": 0, "round": 0, "ckpt": str(final)}) + "\n")
+    (root / "cells.jsonl").write_text(json.dumps({"stage": 0, "task": 0, "kind": "post", "n_rollouts": 10,
+                                                  "successes": 9}) + "\n")
+    (root / "evals.jsonl").write_text(json.dumps({"ckpt": str(final), "task_id": order[0], "n": 10, "k": 9}) + "\n")
+
+
+def reuse(tmp_path, src_over=None, method="fixed", order=("3",)):
+    data = tmp_path / "d"
+    meta = data / "libero_spatial_tasks3" / "all_demos" / "meta"
+    meta.mkdir(parents=True)
+    (meta / "info.json").write_text("{}")
+    (meta / "stats.json").write_text("{}")
+    fake_run(tmp_path / "src", [3], **(src_over or {}))
+    return subprocess.run([sys.executable, str(SCRIPTS / "continual.py"), "--method", method, "--order", *order,
+                           "--data_root", str(data), "--out", str(tmp_path / "runs"), "--avoid", "none",
+                           "--stage0_from", str(tmp_path / "src")], capture_output=True, text=True)
+
+
+def test_stage0_reuse_copies_records(tmp_path):
+    r = reuse(tmp_path)
+    assert r.returncode == 0, r.stderr
+    run = tmp_path / "runs" / "fixed_libero_spatial_o3_s0"
+    cells = [json.loads(x) for x in open(run / "cells.jsonl")]
+    assert cells == [{**cells[0], "stage": 0, "task": 0, "kind": "post", "successes": 9}]
+    assert cells[0]["method"] == "fixed" and cells[0]["run_id"] == run.name
+    st = json.loads(open(run / "stages.jsonl").readline())
+    assert st["reused_from"] == str(tmp_path / "src") and st["method"] == "fixed"
+    assert ">> " not in r.stdout                                # nothing was trained or evaluated
+
+
+def test_stage0_reuse_refuses_different_settings(tmp_path):
+    r = reuse(tmp_path, {"offline_steps": 20000})
+    assert r.returncode != 0 and "offline_steps" in (r.stdout + r.stderr)
