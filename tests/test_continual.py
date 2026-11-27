@@ -193,3 +193,38 @@ def test_stage0_reuse_copies_records(tmp_path):
 def test_stage0_reuse_refuses_different_settings(tmp_path):
     r = reuse(tmp_path, {"offline_steps": 20000})
     assert r.returncode != 0 and "offline_steps" in (r.stdout + r.stderr)
+
+
+# ---------------------------------------------------------------- re-evaluation with more episodes
+def fake_finished(root: Path, method: str, finals: list[str]):
+    root.mkdir(parents=True)
+    (root / "config.json").write_text(json.dumps({"method": method, "seed": 0, "order": [0, 1, 2],
+                                                  "suite": "libero_spatial"}))
+    (root / "stages.jsonl").write_text("".join(json.dumps({"stage": m, "final_ckpt": f}) + "\n"
+                                               for m, f in enumerate(finals)))
+
+
+def test_reeval_plans_every_cell_once_per_checkpoint(tmp_path):
+    main = tmp_path / "fdpg_cumulative"
+    fixed = tmp_path / "fixed"
+    fake_finished(main, "fdpg_cumulative", ["A", "B", "C"])
+    fake_finished(fixed, "fixed", ["A", "A", "A"])          # fixed never moves from stage 0
+    out = subprocess.run([sys.executable, str(SCRIPTS / "reeval.py"), "--dry_run", "--avoid", "none",
+                          str(main), str(fixed)], capture_output=True, text=True, check=True).stdout
+    evals = [line for line in out.splitlines() if line.startswith(">> ")]
+    pairs = [(c.split("--policy.path=")[1].split()[0], c.split("--env.task_ids=[")[1].split("]")[0])
+             for c in evals]
+    # main: post A0, entry A1, post B0 B1, entry B2, post C0 C1 C2 = 8; fixed adds only A on task 2
+    assert len(pairs) == len(set(pairs)) == 9
+    assert ("A", "2") in pairs and all("--eval.n_episodes=50" in c and "--seed=0" in c for c in evals)
+    cells = [json.loads(line[5:]) for line in out.splitlines() if line.startswith("CELL ")]
+    assert len(cells) == 16                                  # 8 cells per 3-task run
+    assert {c["kind"] for c in cells if c["stage"] == 0} == {"post"}
+
+
+def test_reeval_refuses_unfinished_runs(tmp_path):
+    run = tmp_path / "r"
+    fake_finished(run, "fdpg_current", ["A"])
+    r = subprocess.run([sys.executable, str(SCRIPTS / "reeval.py"), "--dry_run", str(run)],
+                       capture_output=True, text=True)
+    assert r.returncode != 0 and "not finished" in (r.stdout + r.stderr)
