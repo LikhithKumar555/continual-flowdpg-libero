@@ -174,6 +174,9 @@ Stage 0 is the same for `fixed`, `fdpg_cold`, `fdpg_current` and the main method
 `--stage0_from <finished run dir>` reuses it (settings are checked). Jobs never overlap the
 reserved GPU hours (`--avoid`, default `Mon,Thu,Fri 14:00-17:00`): the runner waits instead.
 `scripts/queue_pilot.sh` runs the four pilot baselines after the main run.
+`scripts/reeval.py` measures every cell of finished runs again with more episodes (no
+retraining: the stage checkpoints are kept); `scripts/reeval_pilot.sh` does that with 50
+episodes for the five pilot runs once the queue is done, writing `cells_e50.jsonl` per run.
 
 Defaults: 10k offline steps, 4 rounds x 5k steps, 50 episodes per collection, 10 per round eval
 and per triangle cell. `--target 0.9` ends a task's online phase early once its round eval reaches 90%.
